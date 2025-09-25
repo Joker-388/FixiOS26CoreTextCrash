@@ -18,7 +18,7 @@ static inline BOOL jkrIsLowSur (unichar c){ return (c >= 0xDC00 && c <= 0xDFFF);
 
 // 孤立代理修复 + 组合记号限流 + 零宽限额
 // ------------------------------------------------------------
-static const NSUInteger kJKRMaxBibiTotal           = 8;   // 全文最大bibi数量
+static const NSUInteger kJKRMaxBidiTotal           = 8;   // 全文最大bidi数量
 static const NSUInteger kJKRMaxCombiningPerCluster = 8;   // 单个字素簇最多保留的 Mn/Me
 static const NSUInteger kJKRMaxZeroWidthTotal      = 16;  // 全文最多保留的零宽字符
 
@@ -32,7 +32,8 @@ static NSCharacterSet *JKRSetCc(void) {
         [m addCharactersInRange:NSMakeRange(0x007F, 0x21)];  // U+007F–009F
         [m removeCharactersInRange:NSMakeRange('\n', 1)];
         [m removeCharactersInRange:NSMakeRange('\t', 1)];
-        // 可选：把 U+2028/U+2029 也当控制： [m addCharactersInRange:NSMakeRange(0x2028, 2)];
+        // 如需把 U+2028/U+2029 当控制，请解除下一行注释（当前实现默认保留）：
+        // [m addCharactersInRange:NSMakeRange(0x2028, 2)];
         cc = [m copy];
     });
     return cc;
@@ -44,8 +45,8 @@ static NSCharacterSet *JKRSetBidi(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         bidi = [NSCharacterSet characterSetWithCharactersInString:
-                // LRM/RLM + LRE/RLE/LRO/RLO/PDF + LRI/RLI/FSI/PDI
-                @"\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069"];
+                // ALM + LRM/RLM + LRE/RLE/LRO/RLO/PDF + LRI/RLI/FSI/PDI
+                @"\u061C\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069"];
         // 如需把 ZWJ/ZWNJ/ZWSP/WJ 也统计进去，可在此处附加：
         // bidi = [[bidi mutableCopy] removeCharactersInString:@"\u200B\u200C\u200D\u2060"] …（或单独做一个 Cf 集合）
     });
@@ -63,6 +64,7 @@ static NSCharacterSet *JKRSetCombining(void) {
         [m addCharactersInRange:NSMakeRange(0x1DC0, 0x40)];   // 1DC0–1DFF
         [m addCharactersInRange:NSMakeRange(0x20D0, 0x30)];   // 20D0–20FF
         [m addCharactersInRange:NSMakeRange(0xFE20, 0x10)];   // FE20–FE2F
+        [m addCharactersInRange:NSMakeRange(0xFE00, 0x10)];   // FE00–FE0F (VS1–VS16) 变体选择符
         [m addCharactersInRange:NSMakeRange(0x0610, 0x0B)];   // 0610–061A
         [m addCharactersInRange:NSMakeRange(0x064B, 0x15)];   // 064B–065F
         [m addCharactersInRange:NSMakeRange(0x0670, 0x01)];   // 0670
@@ -72,14 +74,118 @@ static NSCharacterSet *JKRSetCombining(void) {
     return set;
 }
 
+// 可回粘的“阿拉伯 base”或 Tatweel（含呈现区）
+static inline BOOL JKRIsArabicBaseOrTatweel(unichar cu) {
+    return (cu == 0x0640) ||                        // Tatweel
+           (cu >= 0x0600 && cu <= 0x06FF) ||        // Arabic
+           (cu >= 0xFB50 && cu <= 0xFDFF) ||        // Arabic Presentation Forms-A
+           (cu >= 0xFE70 && cu <= 0xFEFF);          // Arabic Presentation Forms-B
+}
+
+// 取“簇首连续的 Mn/Me”前缀，至多 limit 个
+static inline NSString *
+JKRCombiningLimitedPrefix(NSString *sub, NSCharacterSet *comb, NSUInteger limit) {
+    if (sub.length == 0 || limit == 0) return @"";
+    NSMutableString *buf = [NSMutableString string];
+    NSUInteger kept = 0;
+    for (NSUInteger i = 0; i < sub.length; i++) {
+        unichar cu = [sub characterAtIndex:i];
+        if (![comb characterIsMember:cu]) break;
+        [buf appendFormat:@"%C", cu];
+        if (++kept >= limit) break;
+    }
+    return buf;
+}
+
+// 统计 fixed 尾部“紧跟在最后一个 base 后”的 Mn/Me 数量（用于回粘前算已有负载）
+static inline NSUInteger
+JKRTrailingCombiningCount(NSString *fixed, NSCharacterSet *comb) {
+    if (fixed.length == 0) return 0;
+    NSUInteger i = fixed.length;
+    NSUInteger cnt = 0;
+    // 从尾部向前，累加连续的 Mn/Me
+    while (i > 0) {
+        unichar cu = [fixed characterAtIndex:i - 1];
+        if (![comb characterIsMember:cu]) break;
+        cnt++;
+        i--;
+    }
+    return cnt;
+}
+
 // 常见零宽字符：ZWSP/ZWNJ/ZWJ/WORD JOINER/BOM
 static NSCharacterSet *JKRSetZeroWidth(void) {
     static NSCharacterSet *set; static dispatch_once_t once;
     dispatch_once(&once, ^{
         set = [NSCharacterSet characterSetWithCharactersInString:
-               @"\u200B\u200C\u200D\u2060\uFEFF"];
+               @"\u00AD\u200B\u200C\u200D\u2060\uFEFF"];
     });
     return set;
+}
+
+/// 将一个“单个字素簇”做 Mn/Me 限额：
+/// - 若簇首即为 Mn/Me（无 base），返回 "�" 并标记 noBase=YES。
+/// - 否则保留 base + 前 limit 个 Mn/Me，超过即裁剪并标记 truncated=YES。
+static inline NSString *
+JKRLimitCombiningInCluster(NSString *sub,
+                           NSCharacterSet *comb,
+                           NSUInteger limit,
+                           BOOL *noBase,
+                           BOOL *truncated)
+{
+    if (noBase) *noBase = NO;
+    if (truncated) *truncated = NO;
+    if (sub.length == 0) return sub;
+
+    // 快速判定：若首 code unit 就是 Mn/Me，则视为“无 base 的异常簇”
+    unichar first = [sub characterAtIndex:0];
+    if ([comb characterIsMember:first]) {
+        if (noBase) *noBase = YES;
+        return @"\uFFFD";
+    }
+
+    // 统计并限额簇内 Mn/Me；如无需裁剪，直接返回原簇
+    NSUInteger combCount = 0;
+    for (NSUInteger i = 0; i < sub.length; i++) {
+        unichar cu = [sub characterAtIndex:i];
+        if ([comb characterIsMember:cu]) {
+            combCount++;
+            if (combCount > limit) { break; }
+        }
+        // 代理对合并前进
+        if (0xD800 <= cu && cu <= 0xDBFF && i + 1 < sub.length) {
+            unichar cu2 = [sub characterAtIndex:i+1];
+            if (0xDC00 <= cu2 && cu2 <= 0xDFFF) { i++; }
+        }
+    }
+    if (combCount <= limit) return sub; // 不超限，原样返回
+
+    // 需要裁剪：重建 “base + 前 limit 个 Mn/Me + 其他非 Mn/Me”
+    NSMutableString *buf = [NSMutableString stringWithCapacity:sub.length];
+    NSUInteger keptComb = 0;
+    for (NSUInteger i = 0; i < sub.length; i++) {
+        unichar cu = [sub characterAtIndex:i];
+        BOOL isComb = [comb characterIsMember:cu];
+        if (isComb) {
+            if (keptComb < limit) {
+                [buf appendFormat:@"%C", cu];
+                keptComb++;
+            } // 超出的直接跳过
+        } else {
+            // 非 Mn/Me：直接保留（包括 base、ZwJ/Zwnj 之外的内容）
+            [buf appendFormat:@"%C", cu];
+        }
+        // 代理对成对拷贝
+        if (0xD800 <= cu && cu <= 0xDBFF && i + 1 < sub.length) {
+            unichar cu2 = [sub characterAtIndex:i+1];
+            if (0xDC00 <= cu2 && cu2 <= 0xDFFF) {
+                [buf appendFormat:@"%C", cu2];
+                i++;
+            }
+        }
+    }
+    if (truncated) *truncated = YES;
+    return buf;
 }
 
 NSDictionary<NSAttributedStringKey,id> *
@@ -100,9 +206,7 @@ jkr_localFixAttributes(NSDictionary<NSAttributedStringKey,id> *attrs,
     // CTFont
     id ctFontObj = m[(id)kCTFontAttributeName];
     if (ctFontObj) {
-        CTFontRef ctf = (__bridge CTFontRef)ctFontObj;
-        CGFloat sz = CTFontGetSize(ctf);
-        if (!(isfinite(sz) && sz > 0 && sz <= 600)) {
+        if (CFGetTypeID((__bridge CFTypeRef)ctFontObj) != CTFontGetTypeID()) {
             UIFont *sys = [UIFont systemFontOfSize:JKRDefaultFontPt];
             CTFontRef safe = CTFontCreateWithName((CFStringRef)sys.fontName, sys.pointSize, NULL);
             if (safe) {
@@ -110,12 +214,25 @@ jkr_localFixAttributes(NSDictionary<NSAttributedStringKey,id> *attrs,
             } else {
                 [m removeObjectForKey:(id)kCTFontAttributeName];
             }
-            if (fontFix) {
-                *fontFix = YES;
-            }
+            if (fontFix) *fontFix = YES;
             changed = YES;
+        } else {
+            CTFontRef ctf = (__bridge CTFontRef)ctFontObj;
+            CGFloat sz = CTFontGetSize(ctf);
+            if (!(isfinite(sz) && sz > 0 && sz <= 600)) {
+                UIFont *sys = [UIFont systemFontOfSize:JKRDefaultFontPt];
+                CTFontRef safe = CTFontCreateWithName((CFStringRef)sys.fontName, sys.pointSize, NULL);
+                if (safe) {
+                    m[(id)kCTFontAttributeName] = (__bridge_transfer id)safe;
+                } else {
+                    [m removeObjectForKey:(id)kCTFontAttributeName];
+                }
+                if (fontFix) *fontFix = YES;
+                changed = YES;
+            }
         }
     }
+    
     // kern
     id kern = m[NSKernAttributeName];
     if (kern) {
@@ -248,20 +365,19 @@ NSString * JKRSanitizePlainString(NSString *s, JKRTextSanitizeStat *statOut) {
     NSMutableString *m = [s mutableCopy];
     
     NSCharacterSet *cc   = JKRSetCc();
-    NSCharacterSet *bibi = JKRSetBidi();
+    NSCharacterSet *bidi = JKRSetBidi();
     NSCharacterSet *comb = JKRSetCombining();
     NSCharacterSet *zw   = JKRSetZeroWidth();
     
     __block BOOL hadSur = NO;
     __block BOOL hadCtrl = NO;
-    __block BOOL hadMoreBibi = NO;
+    __block BOOL hadMoreBidi = NO;
     __block BOOL hadMoreZero = NO;
+    __block BOOL hadMoreComb = NO;
     
-    __block NSUInteger bibiKept = 0;         // 全文保留的bibi数量
-    __block NSUInteger combiningRun = 0;     // 当前簇内连续 Mn/Me 计数
-    __block BOOL haveBaseInCluster = NO;     // 当前簇是否已有 base
+    __block NSUInteger bidiKept = 0;         // 全文保留的bibi数量
+    __block BOOL inBidiRun = NO;             // 是否处于一段连续的bidi控制符run中
     __block NSUInteger zeroWidthKept = 0;    // 全文累计保留的零宽数量
-    
     
     NSMutableString *fixed = [NSMutableString stringWithCapacity:m.length];
     [m enumerateSubstringsInRange:NSMakeRange(0, m.length)
@@ -274,24 +390,30 @@ NSString * JKRSanitizePlainString(NSString *s, JKRTextSanitizeStat *statOut) {
         
         // 控制字符：直接丢弃
         if (sub.length == 1 && [cc characterIsMember:c0]) {
+            inBidiRun = NO;
             hadCtrl = YES;
             return;
         }
         
-        // bibi
-        if (sub.length == 1 && [bibi characterIsMember:c0]) {
-            if (bibiKept < kJKRMaxBibiTotal) {
+        // bidi
+        if (sub.length == 1 && [bidi characterIsMember:c0]) {
+            if (!inBidiRun && bidiKept < kJKRMaxBidiTotal) {
                 [fixed appendString:sub];
-                bibiKept++;
+                bidiKept++;
+                inBidiRun = YES;
             } else {
-                hadMoreBibi = YES;
+                // 折叠（同一 run 内第2个及以后）或超额：丢弃
+                hadMoreBidi = YES;
             }
             return;
+        } else {
+            inBidiRun = NO;
         }
         
         // 孤立代理：直接替换为 U+FFFD（不改变簇状态）
         if (sub.length == 1) {
             if (jkrIsHighSur(c0) || jkrIsLowSur(c0)) {
+                inBidiRun = NO;
                 [fixed appendString:@"\uFFFD"];
                 hadSur = YES;
                 return;
@@ -300,6 +422,7 @@ NSString * JKRSanitizePlainString(NSString *s, JKRTextSanitizeStat *statOut) {
         
         // 零宽字符：全局限额，超过后丢弃；零宽不改变簇的 base/combining 状态
         if ([zw characterIsMember:c0]) {
+            inBidiRun = NO;
             if (zeroWidthKept < kJKRMaxZeroWidthTotal) {
                 [fixed appendString:sub];
                 zeroWidthKept++;
@@ -310,34 +433,47 @@ NSString * JKRSanitizePlainString(NSString *s, JKRTextSanitizeStat *statOut) {
             return;
         }
         
-        // 组合附加记号（Mn/Me）：必须挂在已有 base 后；簇内限额
-        BOOL isComb = (sub.length == 1) && [comb characterIsMember:c0];
-        if (isComb) {
-            if (!haveBaseInCluster) {
-                // 簇首为 Mn/Me：用 U+FFFD 顶一下，避免 CoreText 组合器对无 base 的堆叠失控
-                [fixed appendString:@"\uFFFD"];
+        // 组合附加记号处理：对“整个簇”做限额/纠正
+        {
+            BOOL noBase = NO, truncated = NO;
+            NSString *limited = JKRLimitCombiningInCluster(sub, comb, kJKRMaxCombiningPerCluster, &noBase, &truncated);
+            if (noBase) {
+                // 尝试回粘：仅当 fixed 尾字符是阿拉伯 base 或 Tatweel，且不超簇总上限
+                if (fixed.length > 0) {
+                    unichar prev = [fixed characterAtIndex:fixed.length - 1];
+                    if (JKRIsArabicBaseOrTatweel(prev)) {
+                        // 已有负载
+                        NSUInteger existing = JKRTrailingCombiningCount(fixed, comb);
+                        if (existing < kJKRMaxCombiningPerCluster) {
+                            NSUInteger capacity = kJKRMaxCombiningPerCluster - existing;
+                            NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
+                            if (marks.length > 0) {
+                                [fixed appendString:marks];
+                                // 若原簇前缀超过可用容量则记为截断
+                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
+                                inBidiRun = NO;
+                                return;
+                            }
+                        }
+                    }
+                }
+                // 无法回粘：退回到 U+FFFD
                 hadSur = YES;
-                return;
-            }
-            if (combiningRun < kJKRMaxCombiningPerCluster) {
-                [fixed appendString:sub];
-                combiningRun++;
+                [fixed appendString:@"\uFFFD"];
             } else {
-                // 超额丢弃
-                hadMoreZero = YES;
+                if (truncated) hadMoreComb = YES;
+                [fixed appendString:limited];
             }
-            return;
         }
         
-        // 4) 普通字素（含多 code unit 的 emoji 等）：作为新簇 base，重置计数
-        [fixed appendString:sub];
-        haveBaseInCluster = YES;
-        combiningRun = 0;
+        inBidiRun = NO;
+        return;
     }];
     st.hadCtrl = hadCtrl;
     st.hadSur = hadSur;
-    st.hadMoreBibi = hadMoreBibi;
+    st.hadMoreBidi = hadMoreBidi;
     st.hadMoreZero = hadMoreZero;
+    st.hadMoreComb = hadMoreComb;
 
     st.len1 = fixed.length;
 
@@ -378,18 +514,18 @@ JKRSanitizePlainStringWithMap(NSString *s,
     NSMutableString *m = [s mutableCopy];
 
     NSCharacterSet *cc   = JKRSetCc();
-    NSCharacterSet *bibi = JKRSetBidi();
+    NSCharacterSet *bidi = JKRSetBidi();
     NSCharacterSet *comb = JKRSetCombining();
     NSCharacterSet *zw   = JKRSetZeroWidth();
     
     __block BOOL hadSur = NO;
     __block BOOL hadCtrl = NO;
-    __block BOOL hadMoreBibi = NO;
+    __block BOOL hadMoreBidi = NO;
     __block BOOL hadMoreZero = NO;
+    __block BOOL hadMoreComb = NO;
     
-    __block NSUInteger bibiKept = 0;         // 全文保留的bibi数量
-    __block NSUInteger combiningRun = 0;     // 当前簇内连续 Mn/Me 计数
-    __block BOOL haveBaseInCluster = NO;     // 当前簇是否已有 base
+    __block NSUInteger bidiKept = 0;         // 全文保留的bibi数量
+    __block BOOL inBidiRun = NO;             // 是否处于一段连续的bidi控制符run中
     __block NSUInteger zeroWidthKept = 0;    // 全文累计保留的零宽数量
 
     // 建立旧->新映射
@@ -412,28 +548,33 @@ JKRSanitizePlainStringWithMap(NSString *s,
         // 控制字符：直接丢弃
         if (sub.length == 1 && [cc characterIsMember:c0]) {
             markRangeTo(subRange, newIdx);
+            inBidiRun = NO;
             hadCtrl = YES;
             return;
         }
         
-        // bibi
-        if (sub.length == 1 && [bibi characterIsMember:c0]) {
+        // bidi
+        if (sub.length == 1 && [bidi characterIsMember:c0]) {
             markRangeTo(subRange, newIdx);
-            if (bibiKept < kJKRMaxBibiTotal) {
+            if (!inBidiRun && bidiKept < kJKRMaxBidiTotal) {
                 [fixed appendString:sub];
-                bibiKept++;
+                bidiKept++;
                 newIdx += sub.length;
-                // 修正端点映射：将 old 的 end 指到 “追加后”的 newIdx
                 NSUInteger end = NSMaxRange(subRange);
                 if (end < map.count) map[end] = @(newIdx);
+                inBidiRun = YES;
             } else {
-                hadMoreBibi = YES;
+                // 折叠（同一 run 内第2个及以后）或超额：丢弃（不前进 newIdx）
+                hadMoreBidi = YES;
             }
             return;
+        } else {
+            inBidiRun = NO;
         }
         
         // 孤立代理 -> U+FFFD
         if (sub.length == 1 && (jkrIsHighSur(c0) || jkrIsLowSur(c0))) {
+            inBidiRun = NO;
             markRangeTo(subRange, newIdx);
             [fixed appendString:@"\uFFFD"];
             hadSur = YES;
@@ -445,6 +586,7 @@ JKRSanitizePlainStringWithMap(NSString *s,
         
         // 零宽：限额内保留，否则丢弃（丢弃时不要前进 newIdx）
         if ([zw characterIsMember:c0]) {
+            inBidiRun = NO;
             markRangeTo(subRange, newIdx);
             if (zeroWidthKept < kJKRMaxZeroWidthTotal) {
                 [fixed appendString:sub];
@@ -458,46 +600,53 @@ JKRSanitizePlainStringWithMap(NSString *s,
             }
             return;
         }
-        // 组合记号
-        BOOL isComb = (sub.length == 1) && [comb characterIsMember:c0];
-        if (isComb) {
-            markRangeTo(subRange, newIdx);
-            if (!haveBaseInCluster) {
-                // 无 base：顶 U+FFFD
-                [fixed appendString:@"\uFFFD"];
-                hadSur = YES;
-                newIdx += 1;
-                // 修正端点映射
-                NSUInteger end = NSMaxRange(subRange);
-                if (end < map.count) map[end] = @(newIdx);
-                return;
-            }
-            if (combiningRun < kJKRMaxCombiningPerCluster) {
-                [fixed appendString:sub];
-                combiningRun++;
-                newIdx += sub.length;
-                // 修正端点映射
-                NSUInteger end = NSMaxRange(subRange);
-                if (end < map.count) map[end] = @(newIdx);
-            } else {
-                hadMoreZero = YES;
-            }
-            return;
-        }
-        // 普通 base
+        // 组合记号：与上面逻辑一致，但维护索引映射；无 base → 优先回粘
+        inBidiRun = NO;
         markRangeTo(subRange, newIdx);
-        [fixed appendString:sub];
-        newIdx += sub.length;
-        haveBaseInCluster = YES;
-        combiningRun = 0;
-        // 修正端点映射
-        NSUInteger end = NSMaxRange(subRange);
-        if (end < map.count) map[end] = @(newIdx);
+        {
+            BOOL noBase = NO, truncated = NO;
+            NSString *limited = JKRLimitCombiningInCluster(sub, comb, kJKRMaxCombiningPerCluster, &noBase, &truncated);
+            if (noBase) {
+                BOOL reattached = NO;
+                if (fixed.length > 0) {
+                    unichar prev = [fixed characterAtIndex:fixed.length - 1];
+                    if (JKRIsArabicBaseOrTatweel(prev)) {
+                        NSUInteger existing = JKRTrailingCombiningCount(fixed, comb);
+                        if (existing < kJKRMaxCombiningPerCluster) {
+                            NSUInteger capacity = kJKRMaxCombiningPerCluster - existing;
+                            NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
+                            if (marks.length > 0) {
+                                [fixed appendString:marks];
+                                newIdx += marks.length;
+                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
+                                reattached = YES;
+                            }
+                        }
+                    }
+                }
+                if (!reattached) {
+                    hadSur = YES;
+                    [fixed appendString:@"\uFFFD"];
+                    newIdx += 1;
+                }
+            } else {
+                if (truncated) hadMoreComb = YES;
+                [fixed appendString:limited];
+                newIdx += limited.length;
+            }
+            // 修正端点映射
+            NSUInteger end = NSMaxRange(subRange);
+            if (end < map.count) map[end] = @(newIdx);
+        }
+        
+        inBidiRun = NO;
+        return;
     }];
     st.hadCtrl = hadCtrl;
     st.hadSur = hadSur;
-    st.hadMoreBibi = hadMoreBibi;
+    st.hadMoreBidi = hadMoreBidi;
     st.hadMoreZero = hadMoreZero;
+    st.hadMoreComb = hadMoreComb;
 
     st.len1 = fixed.length;
 
@@ -574,7 +723,8 @@ NSAttributedString * JKRSanitizeAttributedString(NSAttributedString *attr, JKRTe
         st->hadCtrl |= stPlain.hadCtrl;
         st->hadSur |= stPlain.hadSur;
         st->hadMoreZero |= stPlain.hadMoreZero;
-        st->hadMoreBibi |= stPlain.hadMoreBibi;
+        st->hadMoreBidi |= stPlain.hadMoreBidi;
+        st->hadMoreComb |= stPlain.hadMoreComb;
         st->len0 = stPlain.len0;
         st->len1 = stPlain.len1;
     }
@@ -613,7 +763,7 @@ NSAttributedString * JKRSanitizeAttributedStringEasy(NSAttributedString *attr) {
 }
 
 BOOL jkr_isSafe(JKRTextSanitizeStat st) {
-    if (st.len0 != st.len1 || st.hadCtrl || st.hadSur || st.hadMoreZero || st.hadMoreBibi || st.fontFix || st.kernFix || st.baseFix || st.colorFix || st.strokeWidthFix || st.paraFix) {
+    if (st.len0 != st.len1 || st.hadCtrl || st.hadSur || st.hadMoreZero || st.hadMoreBidi || st.hadMoreComb || st.fontFix || st.kernFix || st.baseFix || st.colorFix || st.strokeWidthFix || st.paraFix) {
         JKRTextSafetyLog(@"[CTS] 文本清洗检测到不安全字符串:\n");
         if (st.hadCtrl) {
             JKRTextSafetyLog(@"[CTS] 包含控制字符\n");
@@ -624,8 +774,11 @@ BOOL jkr_isSafe(JKRTextSanitizeStat st) {
         if (st.hadMoreZero) {
             JKRTextSafetyLog(@"[CTS] 包含多余零宽字符\n");
         }
-        if (st.hadMoreBibi) {
-            JKRTextSafetyLog(@"[CTS] 包含多余方向控制\n");
+        if (st.hadMoreBidi) {
+            JKRTextSafetyLog(@"[CTS] 包含多余或不规范的方向控制\n");
+        }
+        if (st.hadMoreComb) {
+            JKRTextSafetyLog(@"[CTS] 包含多余组合记号\n");
         }
         if (st.fontFix) {
             JKRTextSafetyLog(@"[CTS] 包含非法字体\n");

@@ -18,7 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /*
  hadCtrl（BOOL）——命中“控制字符”清洗
- 含义：文本里出现了需要被替换/删除的 Cc 类控制字符（如 U+0000…U+001F、U+2028/2029 等）。通常替换为空格；\n、\t、方向控制字符 保留。
+ 含义：文本里出现了需要被替换/删除的 Cc 类控制字符（如 U+0000…U+001F、U+2028/2029 等）；\n、\t、方向控制字符 保留。
  触发条件：controlCharacterSet 命中（排除 \n\t\方向控制）。
  典型来源：拷贝粘贴的不可见符、接口脏数据、后端转义错误。
  影响/建议：比例偏高 → 上游数据清洗；可在服务端做正则剔除。
@@ -36,9 +36,15 @@ NS_ASSUME_NONNULL_BEGIN
  典型来源：异常长签名/机器人刷屏/富文本粘贴。
  影响/建议：过多零宽字符，会导致iOS26下，计算bound崩溃
  
- hadMoreBibi（BOOL）——命中超额控制字符
+ hadMoreBidi（BOOL）——命中超额控制字符，或者不规范的控制字符
  含义：文本包含超额控制字符
  触发条件：大于控制字符上限，多余会删除
+ 典型来源：异常长签名/机器人刷屏/富文本粘贴。
+ 影响/建议：过多控制字符，会导致iOS26下，计算bound崩溃
+ 
+ hadMoreComb（BOOL）——命组合附加记号
+ 含义：文本包含连续组合附加记号
+ 触发条件：连续组合附加记号，多余会删除
  典型来源：异常长签名/机器人刷屏/富文本粘贴。
  影响/建议：过多控制字符，会导致iOS26下，计算bound崩溃
  
@@ -87,14 +93,14 @@ NS_ASSUME_NONNULL_BEGIN
 
  */
 typedef struct {
-    BOOL hadCtrl, hadSur, hadMoreZero, hadMoreBibi; // 所有string有效
+    BOOL hadCtrl, hadSur, hadMoreZero, hadMoreBidi, hadMoreComb; // 所有string有效
     BOOL fontFix, kernFix, baseFix, colorFix, strokeWidthFix, paraFix; // 只有attrstring才有效
     NSUInteger len0, len1; // 所有string有效
 } JKRTextSanitizeStat;
 
 FOUNDATION_EXPORT const CGFloat    JKRDefaultFontPt;            // 14.0
 
-/// 纯文本清洗（控制字符→删除；孤立代理→U+FFFD；bidi 规范化；长度裁剪）
+/// 纯文本清洗（控制字符→删除；孤立代理→U+FFFD；零宽字符规范化；bidi 规范化；）
 NSString * _Nullable JKRSanitizePlainString(NSString * _Nullable attr, JKRTextSanitizeStat * _Nullable st);
 
 

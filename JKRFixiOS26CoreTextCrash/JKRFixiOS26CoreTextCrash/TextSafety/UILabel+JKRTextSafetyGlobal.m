@@ -75,47 +75,6 @@ static void jkr_exchange(Class c, SEL a, SEL b){
     if (pthread_main_np()) apply(); else dispatch_async(dispatch_get_main_queue(), apply);
 }
 
-//- (BOOL)printWithST:(JKRTextSanitizeStat)st {
-//    if (st.hadCtrl || st.hadSur || st.hadMoreZero || st.hadMoreBibi || st.fontFix || st.kernFix || st.baseFix || st.colorFix || st.strokeWidthFix || st.paraFix || st.len0 != st.len1) {
-//        JKRTextSafetyLog(@"[CTS] 文本设置捕捉到不安全字符串:\n");
-//        if (st.hadCtrl) {
-//            JKRTextSafetyLog(@"[CTS] 包含控制字符\n");
-//        }
-//        if (st.hadSur) {
-//            JKRTextSafetyLog(@"[CTS] 包含孤立代理项\n");
-//        }
-//        if (st.hadMoreZero) {
-//            JKRTextSafetyLog(@"[CTS] 包含多余零宽字符\n");
-//        }
-//        if (st.hadMoreBibi) {
-//            JKRTextSafetyLog(@"[CTS] 包含多余方向控制\n");
-//        }
-//        if (st.fontFix) {
-//            JKRTextSafetyLog(@"[CTS] 包含非法字体\n");
-//        }
-//        if (st.kernFix) {
-//            JKRTextSafetyLog(@"[CTS] 包含非法字距\n");
-//        }
-//        if (st.baseFix) {
-//            JKRTextSafetyLog(@"[CTS] 包含非法基线偏移\n");
-//        }
-//        if (st.colorFix) {
-//            JKRTextSafetyLog(@"[CTS] 包含非法颜色\n");
-//        }
-//        if (st.strokeWidthFix) {
-//            JKRTextSafetyLog(@"[CTS] 包含非法描边\n");
-//        }
-//        if (st.paraFix) {
-//            JKRTextSafetyLog(@"[CTS] 包含非法段落样式\n");
-//        }
-//        if (st.len0 != st.len1) {
-//            JKRTextSafetyLog(@"[CTS] 修正长度对比 %lu - %lu\n", (unsigned long)st.len0, st.len1);
-//        }
-//        return YES;
-//    }
-//    return NO;
-//}
-
 @end
 
 void JKRInstallUILabelTextSafety(void){

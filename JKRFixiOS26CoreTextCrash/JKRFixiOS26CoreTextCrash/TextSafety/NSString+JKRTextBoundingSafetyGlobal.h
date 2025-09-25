@@ -16,23 +16,10 @@ void JKRInstallTextBoundingSafety(void);
 
 @interface NSString (JKRTextBoundingSafetyGlobal)
 
-//- (CGRect)jkr_boundingRectWithSize:(CGSize)size
-//                           options:(NSStringDrawingOptions)opts
-//                        attributes:(nullable NSDictionary<NSAttributedStringKey,id> *)attrs
-//                           context:(nullable NSStringDrawingContext *)context;
-
-//@property (nonatomic) BOOL jkr_isSafeString;
-
 @end
 
 
 @interface NSAttributedString (JKRTextBoundingSafetyGlobal)
-
-//- (CGRect)jkr_boundingRectWithSize:(CGSize)size
-//                           options:(NSStringDrawingOptions)opts
-//                           context:(nullable NSStringDrawingContext *)context;
-
-//@property (nonatomic) BOOL jkr_isSafeString;
 
 @end
 
