@@ -23,7 +23,7 @@ static void jkr_exchange(Class c, SEL a, SEL b){
                            context:(NSStringDrawingContext *)context {
     CGSize safeSize = JKRFixMeasureSize(size);
     if (self.length == 0) {
-        return [self jkr_boundingRectWithSize:size options:opts attributes:attrs context:context];;
+        return [self jkr_boundingRectWithSize:safeSize options:opts attributes:attrs context:context];
     }
     
     if (self.jkr_isSafeString) {
@@ -31,7 +31,7 @@ static void jkr_exchange(Class c, SEL a, SEL b){
         BOOL fontFix = NO, kernFix = NO, baseFix = NO, colorFix = NO, strokeWidthFix = NO, paraFix = NO;
         NSDictionary *fixedAttrs = jkr_localFixAttributes(attrs, &fontFix, &kernFix, &baseFix, &colorFix, &strokeWidthFix, &paraFix);
         if (fontFix || kernFix || baseFix || colorFix || strokeWidthFix || paraFix) {
-            JKRTextSafetyLog(@"[CTS] 计算bound捕捉到不安全字符串");
+            JKRTextSafetyLog(@"[CTS] 计算bound:attributes不安全，已清洗");
             return [self jkr_boundingRectWithSize:safeSize options:opts attributes:fixedAttrs context:context];
         } else {
             return [self jkr_boundingRectWithSize:safeSize options:opts attributes:attrs context:context];
@@ -52,20 +52,11 @@ static void jkr_exchange(Class c, SEL a, SEL b){
     st.paraFix |= paraFix;
     
     if (jkr_isSafe(st) == NO) {
-        JKRTextSafetyLog(@"[CTS] 计算bound: string捕捉到不安全字符串");
+        JKRTextSafetyLog(@"[CTS] 计算bound:string不安全，已清洗");
         return [san jkr_boundingRectWithSize:safeSize options:opts attributes:fixedAttrs context:context];
     } else {
         return [self jkr_boundingRectWithSize:safeSize options:opts attributes:attrs context:context];
     }
-}
-
-- (BOOL)jkr_isSafeString {
-    return [objc_getAssociatedObject(self, _cmd) boolValue];
-}
-
-- (void)setJkr_isSafeString:(BOOL)jkr_isSafeString {
-    SEL key = @selector(jkr_isSafeString);
-    objc_setAssociatedObject(self, key, @(jkr_isSafeString), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 @end
@@ -75,11 +66,11 @@ static void jkr_exchange(Class c, SEL a, SEL b){
 - (CGRect)jkr_boundingRectWithSize:(CGSize)size
                            options:(NSStringDrawingOptions)opts
                            context:(NSStringDrawingContext *)context {
-    if (self.length == 0) {
-        return [self jkr_boundingRectWithSize:size options:opts context:context];
-    }
-    
     CGSize safeSize = JKRFixMeasureSize(size);
+    
+    if (self.length == 0) {
+        return [self jkr_boundingRectWithSize:safeSize options:opts context:context];
+    }
     
     if (self.jkr_isSafeString) {
         return [self jkr_boundingRectWithSize:safeSize options:opts context:context];
@@ -88,10 +79,10 @@ static void jkr_exchange(Class c, SEL a, SEL b){
     JKRTextSanitizeStat st = {0};
     NSAttributedString *m = JKRSanitizeAttributedString(self, &st);
     if (jkr_isSafe(st) == NO) {
-        JKRTextSafetyLog(@"[CTS] 计算bound: attrstring捕捉到不安全字符串");
+        JKRTextSafetyLog(@"[CTS] 计算bound:attrstring不安全，已清洗");
         return [m jkr_boundingRectWithSize:safeSize options:opts context:context];
     } else {
-        return [self jkr_boundingRectWithSize:safeSize options:opts context:context];;
+        return [self jkr_boundingRectWithSize:safeSize options:opts context:context];
     }
 }
 
