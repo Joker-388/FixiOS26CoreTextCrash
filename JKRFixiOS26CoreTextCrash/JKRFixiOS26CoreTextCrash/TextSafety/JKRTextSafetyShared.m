@@ -74,6 +74,47 @@ static NSCharacterSet *JKRSetCombining(void) {
     return set;
 }
 
+// ===== 脚本相容性过滤：只允许“与 base 脚本相容”的 Mn/Me，避免跨脚本堆叠触发 CoreText 崩溃 =====
+typedef NS_OPTIONS(NSUInteger, JKRScriptMask) {
+    JKRScriptLatin    = 1 << 0,
+    JKRScriptArabic   = 1 << 1,
+    JKRScriptCyrillic = 1 << 2,
+    JKRScriptCommon   = 1 << 30, // VS/FE2x 等通用
+    JKRScriptUnknown  = 1 << 31,
+};
+
+static inline JKRScriptMask JKRScriptOfBase(unichar b) {
+    // 拉丁（含扩展）
+    if ((b >= 0x0041 && b <= 0x024F) || (b >= 0x1E00 && b <= 0x1EFF)) return JKRScriptLatin;
+    // 西里尔（含扩展）
+    if ((b >= 0x0400 && b <= 0x052F) || (b >= 0x2DE0 && b <= 0x2DFF) || (b >= 0xA640 && b <= 0xA69F)) return JKRScriptCyrillic;
+    // 阿拉伯（含呈现区/扩展）
+    if ((b >= 0x0600 && b <= 0x06FF) || (b >= 0x0750 && b <= 0x077F) ||
+        (b >= 0x08A0 && b <= 0x08FF) || (b >= 0xFB50 && b <= 0xFDFF) || (b >= 0xFE70 && b <= 0xFEFF)) return JKRScriptArabic;
+    return JKRScriptUnknown;
+}
+
+static inline JKRScriptMask JKRScriptOfComb(unichar m) {
+    // 拉丁记号：0300–036F, 1AB0–1AFF, 1DC0–1DFF
+    if ((m >= 0x0300 && m <= 0x036F) || (m >= 0x1AB0 && m <= 0x1AFF) || (m >= 0x1DC0 && m <= 0x1DFF)) return JKRScriptLatin;
+    // 阿拉伯记号：0610–061A, 064B–065F, 0670, 06D6–06ED
+    if ((m >= 0x0610 && m <= 0x061A) || (m >= 0x064B && m <= 0x065F) || m == 0x0670 || (m >= 0x06D6 && m <= 0x06ED)) return JKRScriptArabic;
+    // FE20–FE2F（组合上标桥）与 FE00–FE0F（VS）视作“通用/安全”
+    if ((m >= 0xFE20 && m <= 0xFE2F) || (m >= 0xFE00 && m <= 0xFE0F)) return JKRScriptCommon;
+    return JKRScriptUnknown;
+}
+
+static inline BOOL JKRCombAllowedForBase(unichar base, unichar mark) {
+    JKRScriptMask bs = JKRScriptOfBase(base);
+    JKRScriptMask ms = JKRScriptOfComb(mark);
+    if (ms == JKRScriptCommon) return YES;
+    if (bs == JKRScriptLatin && ms == JKRScriptLatin) return YES;
+    if (bs == JKRScriptArabic && ms == JKRScriptArabic) return YES;
+    if (bs == JKRScriptCyrillic && ms == JKRScriptCyrillic) return YES;
+    return NO; // 其它组合一律不允许，保守以避坑
+}
+
+
 // 可回粘的“阿拉伯 base”或 Tatweel（含呈现区）
 static inline BOOL JKRIsArabicBaseOrTatweel(unichar cu) {
     return (cu == 0x0640) ||                        // Tatweel
@@ -143,49 +184,52 @@ JKRLimitCombiningInCluster(NSString *sub,
         if (noBase) *noBase = YES;
         return @"\uFFFD";
     }
-
-    // 统计并限额簇内 Mn/Me；如无需裁剪，直接返回原簇
-    NSUInteger combCount = 0;
-    for (NSUInteger i = 0; i < sub.length; i++) {
-        unichar cu = [sub characterAtIndex:i];
-        if ([comb characterIsMember:cu]) {
-            combCount++;
-            if (combCount > limit) { break; }
-        }
-        // 代理对合并前进
-        if (0xD800 <= cu && cu <= 0xDBFF && i + 1 < sub.length) {
-            unichar cu2 = [sub characterAtIndex:i+1];
-            if (0xDC00 <= cu2 && cu2 <= 0xDFFF) { i++; }
-        }
-    }
-    if (combCount <= limit) return sub; // 不超限，原样返回
-
-    // 需要裁剪：重建 “base + 前 limit 个 Mn/Me + 其他非 Mn/Me”
+    
+    // 以 sub[0] 作为 base（这里用首个 code unit 判脚本，足够规避崩溃路径）
+    unichar base0 = first;
     NSMutableString *buf = [NSMutableString stringWithCapacity:sub.length];
+    [buf appendFormat:@"%C", base0];
+    
     NSUInteger keptComb = 0;
-    for (NSUInteger i = 0; i < sub.length; i++) {
+    for (NSUInteger i = 1; i < sub.length; i++) {
         unichar cu = [sub characterAtIndex:i];
         BOOL isComb = [comb characterIsMember:cu];
         if (isComb) {
+            // 新增：按 base 脚本过滤，禁止跨脚本记号
+            if (!JKRCombAllowedForBase(base0, cu)) {
+                if (truncated) *truncated = YES;
+                continue;
+            }
             if (keptComb < limit) {
                 [buf appendFormat:@"%C", cu];
                 keptComb++;
-            } // 超出的直接跳过
-        } else {
-            // 非 Mn/Me：直接保留（包括 base、ZwJ/Zwnj 之外的内容）
-            [buf appendFormat:@"%C", cu];
+            } else {
+                if (truncated) *truncated = YES; // 超簇上限
+            }
+            continue;
         }
-        // 代理对成对拷贝
+        // 非 Mn/Me：直接保留，并照顾代理对
+        [buf appendFormat:@"%C", cu];
         if (0xD800 <= cu && cu <= 0xDBFF && i + 1 < sub.length) {
             unichar cu2 = [sub characterAtIndex:i+1];
-            if (0xDC00 <= cu2 && cu2 <= 0xDFFF) {
-                [buf appendFormat:@"%C", cu2];
-                i++;
-            }
+            if (0xDC00 <= cu2 && cu2 <= 0xDFFF) { [buf appendFormat:@"%C", cu2]; i++; }
         }
     }
-    if (truncated) *truncated = YES;
+    // 若过程中有任一过滤/超限，truncated 已置位；否则表示“按相容性完整保留”
     return buf;
+}
+
+// 计算“簇首连续 Mn/Me 的原始数量”（不受 limit 影响）
+static inline NSUInteger
+JKRLeadingCombiningCount(NSString *sub, NSCharacterSet *comb) {
+    if (sub.length == 0) return 0;
+    NSUInteger cnt = 0;
+    for (NSUInteger i = 0; i < sub.length; i++) {
+        unichar cu = [sub characterAtIndex:i];
+        if (![comb characterIsMember:cu]) break;
+        cnt++;
+    }
+    return cnt;
 }
 
 NSDictionary<NSAttributedStringKey,id> *
@@ -446,11 +490,16 @@ NSString * JKRSanitizePlainString(NSString *s, JKRTextSanitizeStat *statOut) {
                         NSUInteger existing = JKRTrailingCombiningCount(fixed, comb);
                         if (existing < kJKRMaxCombiningPerCluster) {
                             NSUInteger capacity = kJKRMaxCombiningPerCluster - existing;
+//                            NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
+                            // 计算原始前缀数量用于正确置位 hadMoreComb
+                            NSUInteger prefix = JKRLeadingCombiningCount(sub, comb);
                             NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
                             if (marks.length > 0) {
                                 [fixed appendString:marks];
-                                // 若原簇前缀超过可用容量则记为截断
-                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
+//                                // 若原簇前缀超过可用容量则记为截断
+//                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
+                                // 只有当“原始前缀”确实超过可用容量时，才标记为超限
+                                if (prefix > capacity) hadMoreComb = YES;
                                 inBidiRun = NO;
                                 return;
                             }
@@ -614,11 +663,14 @@ JKRSanitizePlainStringWithMap(NSString *s,
                         NSUInteger existing = JKRTrailingCombiningCount(fixed, comb);
                         if (existing < kJKRMaxCombiningPerCluster) {
                             NSUInteger capacity = kJKRMaxCombiningPerCluster - existing;
+//                            NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
+                            NSUInteger prefix = JKRLeadingCombiningCount(sub, comb);
                             NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
                             if (marks.length > 0) {
                                 [fixed appendString:marks];
                                 newIdx += marks.length;
-                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
+//                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
+                                if (prefix > capacity) hadMoreComb = YES;
                                 reattached = YES;
                             }
                         }
