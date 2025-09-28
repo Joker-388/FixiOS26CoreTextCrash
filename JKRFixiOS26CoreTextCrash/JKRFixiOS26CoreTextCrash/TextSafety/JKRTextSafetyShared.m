@@ -490,14 +490,11 @@ NSString * JKRSanitizePlainString(NSString *s, JKRTextSanitizeStat *statOut) {
                         NSUInteger existing = JKRTrailingCombiningCount(fixed, comb);
                         if (existing < kJKRMaxCombiningPerCluster) {
                             NSUInteger capacity = kJKRMaxCombiningPerCluster - existing;
-//                            NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
                             // 计算原始前缀数量用于正确置位 hadMoreComb
                             NSUInteger prefix = JKRLeadingCombiningCount(sub, comb);
                             NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
                             if (marks.length > 0) {
                                 [fixed appendString:marks];
-//                                // 若原簇前缀超过可用容量则记为截断
-//                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
                                 // 只有当“原始前缀”确实超过可用容量时，才标记为超限
                                 if (prefix > capacity) hadMoreComb = YES;
                                 inBidiRun = NO;
@@ -663,13 +660,11 @@ JKRSanitizePlainStringWithMap(NSString *s,
                         NSUInteger existing = JKRTrailingCombiningCount(fixed, comb);
                         if (existing < kJKRMaxCombiningPerCluster) {
                             NSUInteger capacity = kJKRMaxCombiningPerCluster - existing;
-//                            NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
                             NSUInteger prefix = JKRLeadingCombiningCount(sub, comb);
                             NSString *marks = JKRCombiningLimitedPrefix(sub, comb, capacity);
                             if (marks.length > 0) {
                                 [fixed appendString:marks];
                                 newIdx += marks.length;
-//                                if (marks.length < MIN(sub.length, capacity)) hadMoreComb = YES;
                                 if (prefix > capacity) hadMoreComb = YES;
                                 reattached = YES;
                             }
@@ -816,7 +811,7 @@ NSAttributedString * JKRSanitizeAttributedStringEasy(NSAttributedString *attr) {
 
 BOOL jkr_isSafe(JKRTextSanitizeStat st) {
     if (st.len0 != st.len1 || st.hadCtrl || st.hadSur || st.hadMoreZero || st.hadMoreBidi || st.hadMoreComb || st.fontFix || st.kernFix || st.baseFix || st.colorFix || st.strokeWidthFix || st.paraFix) {
-        JKRTextSafetyLog(@"[CTS] 文本清洗检测到不安全字符串:\n");
+        JKRTextSafetyLog(@"[CTS] 文本清洗检测到不安全字符串\n");
         if (st.hadCtrl) {
             JKRTextSafetyLog(@"[CTS] 包含控制字符\n");
         }

@@ -8,10 +8,12 @@
 #import <UIKit/UIKit.h>
 
 // 日志输出
-#ifdef DEBUG
-#define JKRTextSafetyLog(...) NSLog(__VA_ARGS__)
+#define kJKROpenCTSLog 1
+
+#if DEBUG && kJKROpenCTSLog
+  #define JKRTextSafetyLog(...) NSLog(__VA_ARGS__)
 #else
-#define JKRTextSafetyLog(...)
+  #define JKRTextSafetyLog(...)
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
